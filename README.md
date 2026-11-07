@@ -71,9 +71,11 @@ app/
         ├── preferensi.py  matching.py  alokasi.py
 
 sql/schema.sql                  # DDL PostgreSQL (di-generate dari model) + trigger kuota
-sql/seed_contoh.sql             # data master contoh
+sql/seed_contoh.sql             # data master contoh (PostgreSQL)
 scripts/generate_ddl.py         # regenerasi DDL agar sinkron dengan model
 scripts/init_db.py              # create_all untuk development
+scripts/seed_contoh.py          # data master contoh lintas-dialect (SQLite & PostgreSQL), idempoten
+.vscode/                        # konfigurasi F5 (uvicorn, pytest, seed) + interpreter
 tests/                          # ← DELIVERABLE 4 (72 test)
 ```
 
@@ -260,6 +262,56 @@ Query: `periode_id` (wajib), `mahasiswa_id`, `dosen_id`, `status`, `tahap`, `pag
 
 ## 5. Menjalankan
 
+### Cara cepat — VS Code + SQLite (tanpa PostgreSQL)
+
+Prasyarat: Python 3.11+ dan ekstensi **Python** (`ms-python.python`) di VS Code.
+Konfigurasi debug sudah tersedia di `.vscode/`, jadi tidak perlu membuat `launch.json` sendiri.
+
+1. **File → Open Folder** ke folder proyek ini.
+2. Buka terminal terintegrasi (`` Ctrl+` ``) lalu:
+
+   ```bash
+   python -m venv .venv
+   # Windows: .venv\Scripts\activate   |  Linux/macOS: source .venv/bin/activate
+   pip install -r requirements-dev.txt
+   cp .env.example .env               # Windows PowerShell: Copy-Item .env.example .env
+   ```
+
+3. Sunting `.env`, ganti baris database ke SQLite:
+
+   ```dotenv
+   APP_DATABASE_URL=sqlite:///./dev.db
+   ```
+
+4. `Ctrl+Shift+P` → **Python: Select Interpreter** → pilih `.venv`.
+   (`.vscode/settings.json` sudah menunjuk ke sana sebagai default.)
+5. **F5** → pilih **Seed: data master contoh**. Ini membuat `dev.db`, seluruh tabel,
+   lalu 1 periode (`2026-GANJIL`, status `open`), 3 dosen (kuota 2/1/1), dan 5 mahasiswa.
+   Skrip ini idempoten — dijalankan ulang tidak mengubah apa pun.
+6. **F5** → pilih **FastAPI: uvicorn (reload)**. Server hidup di `http://localhost:8000`
+   dengan auto-reload. Bila breakpoint tidak mengikat, hapus `--reload` dari `args`
+   di `.vscode/launch.json` — reload menjalankan proses anak.
+7. Buka **http://localhost:8000/docs** untuk Swagger UI, atau ikuti alur curl di bawah.
+
+Dua konfigurasi F5 lain: **Pytest: seluruh test** (72 test, tanpa database eksternal)
+dan **Seed** di atas. Semua bisa juga dijalankan lewat terminal biasa:
+
+```bash
+python -m scripts.seed_contoh
+uvicorn app.main:app --reload --port 8000
+pytest
+```
+
+> SQLite tidak memiliki trigger kuota deferred seperti PostgreSQL. Di mode ini kepatuhan
+> kuota dijaga oleh algoritma + `verify_matching()` sebelum persist (dan diuji otomatis).
+> Untuk produksi tetap gunakan PostgreSQL dengan `sql/schema.sql`.
+>
+> Seed hanya mengisi **data master**. Preferensi sengaja tidak di-seed supaya bisa
+> dicoba lewat `POST /api/preferensi`. Belum ada endpoint CRUD master data — itu langkah
+> berikutnya (lihat §6).
+
+### Setup PostgreSQL
+
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate   |  Linux/macOS: source .venv/bin/activate
@@ -267,13 +319,13 @@ pip install -r requirements-dev.txt
 cp .env.example .env                # lalu sunting APP_DATABASE_URL & APP_ADMIN_API_KEY
 ```
 
-Buat skema (pilih satu):
+Buat skema:
 
 ```bash
 psql "postgresql://postgres:postgres@localhost:5432/alokasi_pembimbing" -f sql/schema.sql
 psql "$DATABASE_URL" -f sql/seed_contoh.sql   # opsional, data contoh
-# atau untuk development cepat (tanpa trigger kuota):
-python -m scripts.init_db
+# atau lintas-dialect lewat ORM (tanpa trigger kuota):
+python -m scripts.seed_contoh
 ```
 
 Jalankan API:
@@ -282,23 +334,61 @@ Jalankan API:
 uvicorn app.main:app --reload --port 8000
 ```
 
-Contoh alur lengkap:
+### Contoh alur lengkap
+
+Setelah `scripts.seed_contoh`: `periode_id=1`, dosen `1..3` (kuota 2/1/1 = 4 kursi),
+mahasiswa `1..5`. Karena kursi < pendaftar, satu mahasiswa tidak teralokasi — itulah
+kandidat alami untuk mekanisme susulan.
+
+Perintah di bawah untuk Git Bash / Linux / macOS. Di PowerShell pakai `curl.exe`
+dan kutip ganda escaped, atau lebih mudah: lewat Swagger UI di `/docs`.
 
 ```bash
 B=http://localhost:8000
+K=dev-admin-key                      # nilai APP_ADMIN_API_KEY di .env
+
+# 1. Preferensi mahasiswa (boleh sebagian atau seluruh dosen)
 curl -X POST $B/api/preferensi -H 'Content-Type: application/json' \
      -d '{"periode_id":1,"mahasiswa_id":1,"dosen_ids":[1,2,3]}'
-curl -X POST $B/api/preferensi/dosen -H 'Content-Type: application/json' \
-     -d '{"periode_id":1,"dosen_id":1,"mahasiswa_ids":[3,2,1]}'
-curl -X POST $B/api/matching/execute -H 'Content-Type: application/json' \
-     -H "X-API-Key: $APP_ADMIN_API_KEY" -d '{"periode_id":1,"tahap":"utama"}'
-curl "$B/api/alokasi?periode_id=1"
-# late-register:
+curl -X POST $B/api/preferensi -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"mahasiswa_id":2,"dosen_ids":[1,2]}'
+curl -X POST $B/api/preferensi -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"mahasiswa_id":3,"dosen_ids":[2,1]}'
 curl -X POST $B/api/preferensi -H 'Content-Type: application/json' \
      -d '{"periode_id":1,"mahasiswa_id":4,"dosen_ids":[3,1]}'
+curl -X POST $B/api/preferensi -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"mahasiswa_id":5,"dosen_ids":[1,3]}'
+
+# 2. Preferensi dosen (peringkat mahasiswa)
+curl -X POST $B/api/preferensi/dosen -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"dosen_id":1,"mahasiswa_ids":[1,2,5,3,4]}'
+curl -X POST $B/api/preferensi/dosen -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"dosen_id":2,"mahasiswa_ids":[3,1,2]}'
+curl -X POST $B/api/preferensi/dosen -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"dosen_id":3,"mahasiswa_ids":[4,5]}'
+
+# 3. Eksekusi utama (admin). Tambahkan "dry_run":true untuk menghitung tanpa menyimpan.
 curl -X POST $B/api/matching/execute -H 'Content-Type: application/json' \
-     -H "X-API-Key: $APP_ADMIN_API_KEY" -d '{"periode_id":1,"tahap":"susulan"}'
+     -H "X-API-Key: $K" -d '{"periode_id":1,"tahap":"utama"}'
+# → 4 alokasi, verifikasi.stabil=true, mahasiswa_tidak_teralokasi=[5]
+
+# 4. Lihat hasil
+curl "$B/api/alokasi?periode_id=1"
+
+# 5. Susulan: mahasiswa 5 menambah pilihan ke dosen yang masih punya kursi sisa.
+#    (Kuota dinaikkan lebih dulu oleh admin; belum ada endpoint untuk ini.)
+curl -X POST $B/api/preferensi -H 'Content-Type: application/json' \
+     -d '{"periode_id":1,"mahasiswa_id":5,"dosen_ids":[1,3,2]}'
+curl -X POST $B/api/matching/execute -H 'Content-Type: application/json' \
+     -H "X-API-Key: $K" -d '{"periode_id":1,"tahap":"susulan"}'
+# → 4 alokasi terkunci dipertahankan utuh, 1 alokasi baru (5 → dosen 2).
+#    peringkat_dosen=null karena dosen 2 tidak memeringkat mahasiswa 5
+#    (kebijakan APPEND: diterima di dasar daftar, bukan ditolak).
 ```
+
+Catatan: `tahap:"utama"` akan menolak (409) bila sudah ada alokasi terkunci pada
+periode itu — gunakan `susulan`. Mengirim preferensi mahasiswa yang alokasinya sudah
+terkunci juga 409.
 
 ### Test
 
