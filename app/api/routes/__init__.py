@@ -1,0 +1,1 @@
+"""Endpoint per sumber daya."""
